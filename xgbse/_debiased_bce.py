@@ -6,6 +6,7 @@ from joblib import Parallel, delayed
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import BallTree
 from sklearn.preprocessing import OneHotEncoder
+from scipy.sparse import hstack
 
 # lib utils
 from xgbse._base import XGBSEBaseEstimator, DummyLogisticRegression
@@ -150,7 +151,8 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
         self.n_jobs = n_jobs
         self.persist_train = False
         self.feature_importances_ = None
-
+        print("This is anthony version's XGBSEDebiasedBCE.")
+ 
     def fit(
         self,
         X,
@@ -162,6 +164,7 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
         persist_train=False,
         index_id=None,
         time_bins=None,
+        dynamic_dataset=None
     ):
         """
         Transform feature space by fitting a XGBoost model and returning its leaf indices.
@@ -200,10 +203,12 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
         """
 
         E_train, T_train = convert_y(y)
+        
         if time_bins is None:
             time_bins = get_time_bins(T_train, E_train)
-        self.time_bins = time_bins
 
+        self.time_bins = time_bins
+        
         # converting data to xgb format
         dtrain = convert_data_to_xgb_format(X, y, self.xgb_params["objective"])
 
@@ -239,7 +244,7 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
         )
 
         # fitting LR for several targets
-        self.lr_estimators_ = self._fit_all_lr(leaves_encoded, self.targets)
+        self.lr_estimators_ = self._fit_all_lr(leaves_encoded, self.targets, dynamic_dataset)
 
         if persist_train:
             self.persist_train = True
@@ -255,7 +260,7 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
 
         return self
 
-    def _fit_one_lr(self, leaves_encoded, target):
+    def _fit_one_lr(self, leaves_encoded, dynamic_frequency, dynamic_recency, target):
         """
         Fits a single logistic regression to predict survival probability
         at a certain time bin as target. Encoded leaves are used as features.
@@ -270,6 +275,8 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
             Regression model. This model outputs calibrated survival probabilities
             on a time T.
         """
+
+        print('Enter one LR fitting - fit with the dynamic features.')
 
         # masking
         mask = target != -1
@@ -287,11 +294,18 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
                 "Warning: Only one class found in a time bucket", RuntimeWarning
             )
             classifier = DummyLogisticRegression()
+ 
+        leaves_feature = leaves_encoded[mask, :]
+        dynamic_frequency_feature = dynamic_frequency.loc[mask].to_numpy().reshape(-1, 1)
+        dynamic_recency_feature = dynamic_recency.loc[mask].to_numpy().reshape(-1, 1)
+        
+        features = hstack([leaves_feature, dynamic_frequency_feature, dynamic_recency_feature])
 
-        classifier.fit(leaves_encoded[mask, :], target[mask])
+        classifier.fit(features, target[mask])
+
         return classifier
 
-    def _fit_all_lr(self, leaves_encoded, targets):
+    def _fit_all_lr(self, leaves_encoded, targets, dynamic_dataset):
         """
         Fits multiple Logistic Regressions to predict survival probability
         for a list of time bins as target. Encoded leaves are used as features.
@@ -306,16 +320,21 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
                 These models output calibrated survival probabilities for all times
                 in pre specified time bins.
         """
+        print('Enter all LR fitting - fit with the dynamic features.')
+    
+        dynamic_frequency =  dynamic_dataset[0]
+        dynamic_recency = dynamic_dataset[1]
 
         with Parallel(n_jobs=self.n_jobs) as parallel:
+        # with Parallel(n_jobs=1) as parallel:
             lr_estimators = parallel(
-                delayed(self._fit_one_lr)(leaves_encoded, targets[:, i])
+                delayed(self._fit_one_lr)(leaves_encoded, dynamic_frequency.iloc[:, i], dynamic_recency.iloc[:, i], targets[:, i])
                 for i in range(targets.shape[1])
             )
 
         return lr_estimators
 
-    def _predict_from_lr_list(self, lr_estimators, leaves_encoded, time_bins):
+    def _predict_from_lr_list(self, lr_estimators, leaves_encoded, time_bins, dynamic_dataset):
         """
         Predicts survival probabilities from a list of multiple fitted
         Logistic Regressions models. Encoded leaves are used as features.
@@ -335,9 +354,25 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
                 (rows).
         """
 
+        def combine_test_features(leaves_encoded, dynamic_frequency, dynamic_recency):
+
+            leaves_feature = leaves_encoded
+            dynamic_frequency_feature = dynamic_frequency.to_numpy().reshape(-1, 1)
+            dynamic_recency_feature = dynamic_recency.to_numpy().reshape(-1, 1)
+            
+            features = hstack([leaves_feature, dynamic_frequency_feature, dynamic_recency_feature])
+
+            return features
+        
+        dynamic_frequency =  dynamic_dataset[0]
+        dynamic_recency = dynamic_dataset[1]
+
         with Parallel(n_jobs=self.n_jobs) as parallel:
             preds = parallel(
-                delayed(m.predict_proba)(leaves_encoded) for m in lr_estimators
+                delayed(lr_estimators[m].predict_proba)(combine_test_features(leaves_encoded, 
+                                                                              dynamic_frequency.iloc[:, m], 
+                                                                              dynamic_recency.iloc[:, m]
+                                                                             )) for m in range(len(lr_estimators))
             )
 
         # organizing interval predictions from LRs
@@ -348,7 +383,7 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
         # to cumulative survival curve
         return hazard_to_survival(preds)
 
-    def predict(self, X, return_interval_probs=False):
+    def predict(self, X, return_interval_probs=False, dynamic_dataset=None):
         """
         Predicts survival probabilities using the XGBoost + Logistic Regression pipeline.
 
@@ -377,9 +412,9 @@ class XGBSEDebiasedBCE(XGBSEBaseEstimator):
         leaves_encoded = self.encoder.transform(leaves)
 
         # predicting from logistic regression artifacts
-
+        
         preds_df = self._predict_from_lr_list(
-            self.lr_estimators_, leaves_encoded, self.time_bins
+            self.lr_estimators_, leaves_encoded, self.time_bins, dynamic_dataset
         )
 
         if return_interval_probs:
